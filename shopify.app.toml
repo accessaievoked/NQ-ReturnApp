@@ -1,0 +1,44 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "05fca9e0160be5e9c0952eaf126b214d"
+name = "eco-return-demo"
+application_url = "https://example.com"
+embedded = true
+
+[access_scopes]
+scopes = "read_orders,read_products,read_customers,read_returns,write_returns"
+
+[webhooks]
+api_version = "2026-07"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/returns"
+  topics = [
+    "returns/request",
+    "returns/approve",
+    "returns/decline",
+    "returns/cancel",
+    "returns/close",
+    "returns/reopen",
+    "returns/process",
+    "returns/update"
+  ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products"
+  topics = [ "products/create", "products/update", "products/delete" ]
+
+[auth]
+redirect_urls = [ "https://example.com/api/auth" ]
+
+[build]
+include_config_on_deploy = true
+automatically_update_urls_on_dev = true
