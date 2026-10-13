@@ -43,6 +43,8 @@ model Shop {
   products Product[]
   returns  ReturnRequest[]
   events   ReturnEvent[]
+  rules    AutomationRule[]
+  runs     AutomationRun[]
 }
 
 model Product {
@@ -107,6 +109,16 @@ model ReturnRequest {
   totalQuantity   Int          @default(0)
   declineReason   String?
   declineNote     String?
+  returnValue     Decimal      @default(0) @db.Decimal(12, 2) // sum(unitPrice * quantity) of the returned items
+  autoHandled     Boolean      @default(false) // true when an automation rule approved/declined it
+  refundedAmount  Decimal      @default(0) @db.Decimal(12, 2) // sum of Shopify refunds linked to this return (order currency)
+  refundedAt      DateTime?
+  exchangeUnits   Int          @default(0) // units the customer asked for in exchange (0 = plain return)
+  exchangeDone    Int          @default(0) // exchange units already processed
+  exchangeItems   Json? // replacement products the customer is taking: [{ id, title, variantTitle, sku, imageUrl, quantity, processedQuantity, unitPrice }]
+  shipmentStatus  String? // AWAITING_SHIPMENT | IN_TRANSIT | RECEIVED | CANCELED (from reverse fulfillment orders)
+  awb             String? // return-shipment tracking number
+  carrier         String?
   requestedAt     DateTime
   closedAt        DateTime?
   createdAt       DateTime     @default(now())
@@ -115,10 +127,12 @@ model ReturnRequest {
   shop   Shop          @relation(fields: [shopId], references: [id], onDelete: Cascade)
   items  ReturnItem[]
   events ReturnEvent[]
+  runs   AutomationRun[]
 
   @@unique([shopId, shopifyId])
   @@index([shopId, status])
   @@index([shopId, requestedAt])
+  @@index([shopId, customerEmail])
 }
 
 model ReturnItem {
@@ -168,4 +182,47 @@ model ReturnEvent {
   return ReturnRequest @relation(fields: [returnId], references: [id], onDelete: Cascade)
 
   @@index([returnId, createdAt])
+}
+
+enum RuleAction {
+  APPROVE
+  DECLINE
+}
+
+// Merchant-defined automation: when ALL conditions match a new return request, take `action`.
+// Rules are evaluated in ascending `priority`; the first match wins.
+model AutomationRule {
+  id          String     @id @default(cuid())
+  shopId      String
+  name        String
+  enabled     Boolean    @default(true)
+  priority    Int        @default(100)
+  action      RuleAction
+  declineNote String? // shown to the customer when action = DECLINE
+  conditions  Json // see RuleConditions in services/automation.server.ts
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  shop Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  runs AutomationRun[]
+
+  @@index([shopId, enabled, priority])
+}
+
+// Audit log: one row each time a rule fired (powers the Automations KPI and "hours saved").
+model AutomationRun {
+  id        String     @id @default(cuid())
+  shopId    String
+  ruleId    String?
+  returnId  String
+  action    RuleAction
+  ok        Boolean    @default(true)
+  error     String?
+  createdAt DateTime   @default(now())
+
+  shop   Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  rule   AutomationRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+  return ReturnRequest   @relation(fields: [returnId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, createdAt])
 }

@@ -1,4 +1,4 @@
-﻿import { Prisma, type ReturnStatus } from "@prisma/client";
+import { Prisma, type ReturnStatus } from "@prisma/client";
 import db from "../db.server";
 import { getAdmin, gql } from "./admin-client.server";
 import { ensureShop } from "./shop.server";
@@ -9,9 +9,29 @@ const RETURN_QUERY = `#graphql
       id
       name
       status
+      createdAt
       closedAt
       totalQuantity
       decline { reason note }
+      refunds(first: 10) { nodes { id processedAt totalRefundedSet { shopMoney { amount } } } }
+      exchangeLineItems(first: 20) {
+        nodes {
+          id
+          quantity
+          processedQuantity
+          variantId
+          lineItems { title variantTitle sku image { url } originalUnitPriceSet { shopMoney { amount } } }
+        }
+      }
+      reverseFulfillmentOrders(first: 5) {
+        nodes {
+          id
+          status
+          reverseDeliveries(first: 5) {
+            nodes { id deliverable { __typename ... on ReverseDeliveryShippingDeliverable { tracking { number carrierName url } } } }
+          }
+        }
+      }
       order {
         id
         name
@@ -55,8 +75,28 @@ type ReturnPayload = {
     id: string;
     name: string;
     status: ReturnStatus;
+    createdAt: string;
     closedAt: string | null;
     totalQuantity: number;
+    refunds: { nodes: { id: string; processedAt: string | null; totalRefundedSet: { shopMoney: { amount: string } } }[] };
+    exchangeLineItems: {
+      nodes: {
+        id: string;
+        quantity: number;
+        processedQuantity: number;
+        variantId: string | null;
+        lineItems: { title: string; variantTitle: string | null; sku: string | null; image: { url: string } | null; originalUnitPriceSet: { shopMoney: { amount: string } } }[];
+      }[];
+    };
+    reverseFulfillmentOrders: {
+      nodes: {
+        id: string;
+        status: "OPEN" | "CLOSED" | "CANCELED";
+        reverseDeliveries: {
+          nodes: { id: string; deliverable: { tracking?: { number: string | null; carrierName: string | null; url: string | null } | null } | null }[];
+        };
+      }[];
+    };
     decline: { reason: string | null; note: string | null } | null;
     order: {
       id: string;
@@ -101,8 +141,51 @@ type ReturnPayload = {
  * Pulls the full return from Shopify and upserts it (plus items) into our DB.
  * Idempotent: safe to call for every webhook delivery and for backfills.
  * Returns the local ReturnRequest, and whether the status changed.
+ * Brand-new REQUESTED returns are passed to the automation rules unless `automate` is false
+ * (the historical backfill turns it off so old requests aren't auto-decided on install).
  */
-export async function ingestReturn(shopDomain: string, returnGid: string, source = "Shopify") {
+type ExchangeVariant = {
+  id: string;
+  title: string;
+  sku: string | null;
+  price: string;
+  product: { title: string; featuredMedia: { preview: { image: { url: string } | null } | null } | null };
+};
+
+const EXCHANGE_VARIANTS_QUERY = `#graphql
+  query ExchangeVariants($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on ProductVariant {
+        id
+        title
+        sku
+        price
+        product { title featuredMedia { preview { image { url } } } }
+      }
+    }
+  }`;
+
+async function fetchVariants(admin: Awaited<ReturnType<typeof getAdmin>>, ids: string[]) {
+  const data = await gql<{ nodes: (ExchangeVariant | null)[] }>(admin, EXCHANGE_VARIANTS_QUERY, { ids });
+  return new Map(data.nodes.filter((n): n is ExchangeVariant => !!n?.id).map((n) => [n.id, n]));
+}
+
+export type ShipmentStatus = "AWAITING_SHIPMENT" | "IN_TRANSIT" | "RECEIVED" | "CANCELED";
+
+/** Collapse Shopify's reverse fulfillment orders into one status for the list. */
+export function shipmentStatusOf(statuses: string[], hasTracking: boolean): ShipmentStatus | null {
+  if (!statuses.length) return null;
+  if (statuses.every((x) => x === "CANCELED")) return "CANCELED";
+  if (statuses.some((x) => x === "CLOSED")) return "RECEIVED";
+  return hasTracking ? "IN_TRANSIT" : "AWAITING_SHIPMENT";
+}
+
+export async function ingestReturn(
+  shopDomain: string,
+  returnGid: string,
+  source = "Shopify",
+  opts: { automate?: boolean } = {},
+) {
   const shop = await ensureShop(shopDomain);
   const admin = await getAdmin(shopDomain);
   const data = await gql<ReturnPayload>(admin, RETURN_QUERY, { id: returnGid });
@@ -111,9 +194,59 @@ export async function ingestReturn(shopDomain: string, returnGid: string, source
 
   const existing = await db.returnRequest.findUnique({
     where: { shopId_shopifyId: { shopId: shop.id, shopifyId: r.id } },
-    select: { id: true, status: true },
+    select: { id: true, status: true, shipmentStatus: true },
   });
 
+  // First time we see the store's currency, remember it (every returnValue is stored in it).
+  if (!shop.currency) await db.shop.update({ where: { id: shop.id }, data: { currency: r.order.totalPriceSet.shopMoney.currencyCode } });
+  const returnValue = r.returnLineItems.nodes.reduce(
+    (sum, n) =>
+      n.id && n.fulfillmentLineItem
+        ? sum + Number(n.fulfillmentLineItem.lineItem.originalUnitPriceSet.shopMoney.amount) * (n.quantity ?? 1)
+        : sum,
+    0,
+  );
+  const refundedAmount = r.refunds.nodes.reduce((n, f) => n + Number(f.totalRefundedSet.shopMoney.amount), 0);
+  const refundedAt = r.refunds.nodes.map((f) => f.processedAt).filter((d): d is string => !!d).sort().at(-1) ?? null;
+  const exchangeUnits = r.exchangeLineItems.nodes.reduce((n, e) => n + e.quantity, 0);
+  const exchangeDone = r.exchangeLineItems.nodes.reduce((n, e) => n + e.processedQuantity, 0);
+  // The replacement products the customer is taking, flattened for display (one entry per exchange line).
+  // Before the exchange is released Shopify has no order line items for it, only the variant being exchanged into.
+  const variantIds = r.exchangeLineItems.nodes.filter((e) => !e.lineItems.length && e.variantId).map((e) => e.variantId!);
+  const variants = variantIds.length ? await fetchVariants(admin, variantIds) : new Map<string, ExchangeVariant>();
+  const exchangeItems = r.exchangeLineItems.nodes.flatMap((e) => {
+    const li = e.lineItems[0];
+    if (li) {
+      return [{
+        id: e.id,
+        title: li.title,
+        variantTitle: li.variantTitle,
+        sku: li.sku,
+        imageUrl: li.image?.url ?? null,
+        quantity: e.quantity,
+        processedQuantity: e.processedQuantity,
+        unitPrice: Number(li.originalUnitPriceSet.shopMoney.amount),
+      }];
+    }
+    const v = e.variantId ? variants.get(e.variantId) : undefined;
+    return [{
+      id: e.id,
+      title: v?.product.title ?? "Replacement item",
+      variantTitle: v && v.title !== "Default Title" ? v.title : null,
+      sku: v?.sku ?? null,
+      imageUrl: v?.product.featuredMedia?.preview?.image?.url ?? null,
+      quantity: e.quantity,
+      processedQuantity: e.processedQuantity,
+      unitPrice: Number(v?.price ?? 0),
+    }];
+  });
+  const tracking = r.reverseFulfillmentOrders.nodes
+    .flatMap((o) => o.reverseDeliveries.nodes)
+    .map((d) => d.deliverable?.tracking)
+    .find((t) => t?.number);
+  const derivedShipment = shipmentStatusOf(r.reverseFulfillmentOrders.nodes.map((o) => o.status), !!tracking);
+  // "Received" can be marked inside this app too; don't let a later Shopify sync undo it unless the shipment was canceled.
+  const shipmentStatus = existing?.shipmentStatus === "RECEIVED" && derivedShipment !== "CANCELED" ? "RECEIVED" : derivedShipment;
   const customerName = r.order.customer?.displayName ?? r.order.shippingAddress?.name ?? null;
   const fields = {
     name: r.name,
@@ -129,6 +262,15 @@ export async function ingestReturn(shopDomain: string, returnGid: string, source
     customerPhone: r.order.customer?.defaultPhoneNumber?.phoneNumber ?? r.order.phone,
     shippingAddress: (r.order.shippingAddress ?? Prisma.JsonNull) as Prisma.InputJsonValue,
     totalQuantity: r.totalQuantity,
+    returnValue,
+    refundedAmount,
+    refundedAt: refundedAt ? new Date(refundedAt) : null,
+    exchangeUnits,
+    exchangeDone,
+    exchangeItems: exchangeItems.length ? exchangeItems : Prisma.JsonNull,
+    shipmentStatus,
+    // Only overwrite tracking when Shopify has some, so a number saved in this app isn't wiped by a sync.
+    ...(tracking ? { awb: tracking.number, carrier: tracking.carrierName } : {}),
     declineReason: r.decline?.reason ?? null,
     declineNote: r.decline?.note ?? null,
     closedAt: r.closedAt ? new Date(r.closedAt) : null,
@@ -136,8 +278,8 @@ export async function ingestReturn(shopDomain: string, returnGid: string, source
 
   const saved = await db.returnRequest.upsert({
     where: { shopId_shopifyId: { shopId: shop.id, shopifyId: r.id } },
-    create: { shopId: shop.id, shopifyId: r.id, requestedAt: new Date(), ...fields },
-    update: fields,
+    create: { shopId: shop.id, shopifyId: r.id, requestedAt: new Date(r.createdAt), ...fields },
+    update: { ...fields, requestedAt: new Date(r.createdAt) }, // Shopify's real request time, so re-syncs repair old rows
   });
 
   // Map Shopify product/variant GIDs to our local rows (null when not synced yet).
@@ -179,9 +321,17 @@ export async function ingestReturn(shopDomain: string, returnGid: string, source
   if (statusChanged) {
     await addEvent(shop.id, saved.id, {
       kind: "WEBHOOK",
-      title: existing ? `Status changed to ${saved.status}` : "Return requested",
+      title: existing
+        ? `Status changed to ${saved.status}`
+        : saved.status === "REQUESTED"
+          ? "Return requested"
+          : `Return created in Shopify (already ${saved.status === "OPEN" ? "approved" : saved.status.toLowerCase()})`,
       actor: source,
     });
+  }
+  if (!existing && saved.status === "REQUESTED" && opts.automate !== false) {
+    const { runAutomations } = await import("./automation.server"); // lazy: automation.server imports this file
+    await runAutomations(shopDomain, saved.id);
   }
   return { ret: saved, statusChanged };
 }
@@ -216,7 +366,7 @@ export async function syncAllReturns(shopDomain: string) {
     } = await gql(admin, query, { cursor });
     for (const o of page.orders.nodes) {
       for (const r of o.returns.nodes) {
-        await ingestReturn(shopDomain, r.id, "Initial sync");
+        await ingestReturn(shopDomain, r.id, "Initial sync", { automate: false });
         count++;
       }
     }
@@ -276,10 +426,315 @@ export async function performReturnAction(
   await ingestReturn(shopDomain, ret.shopifyId, actor);
   await addEvent(shop.id, ret.id, {
     kind: "ACTION",
-    title: `Merchant ${action === "close" ? "closed" : action + (action.endsWith("e") ? "d" : "ed")} the return`,
+    title: `${actor.startsWith("Automation") ? "Automation" : "Merchant"} ${action === "close" ? "closed" : action + (action.endsWith("e") ? "d" : "ed")} the return`,
     detail: note || undefined,
     actor,
   });
   return { ok: true as const };
 }
 
+// ---- Refund, tracking and receiving ----
+
+const REFUND_BASIS_QUERY = `#graphql
+  query RefundBasis($id: ID!) {
+    return(id: $id) {
+      returnLineItems(first: 100) { nodes { ... on ReturnLineItem { id processableQuantity } } }
+    }
+  }`;
+
+const REFUND_SUGGEST_QUERY = `#graphql
+  query RefundSuggestion($id: ID!, $items: [SuggestedOutcomeReturnLineItemInput!]!) {
+    return(id: $id) {
+      suggestedFinancialOutcome(returnLineItems: $items, exchangeLineItems: []) {
+        financialTransfer {
+          __typename
+          ... on RefundReturnOutcome {
+            amount { shopMoney { amount currencyCode } }
+            suggestedTransactions {
+              ... on SuggestedOrderTransaction { amountSet { shopMoney { amount currencyCode } } parentTransaction { id } }
+            }
+          }
+        }
+      }
+    }
+  }`;
+
+const PROCESS_RETURN = `#graphql
+  mutation ProcessReturn($input: ReturnProcessInput!) {
+    returnProcess(input: $input) { return { id status } userErrors { field message } }
+  }`;
+
+/**
+ * Refunds the customer through Shopify: asks Shopify what it would refund for the unprocessed items, then processes the
+ * return with exactly that suggestion (same amount, same original payment transaction). Real money moves, so callers
+ * confirm first and this refuses anything that is not an approved/open return.
+ */
+export async function issueRefund(shopDomain: string, localReturnId: string, actor: string) {
+  const shop = await ensureShop(shopDomain);
+  const ret = await db.returnRequest.findFirst({ where: { id: localReturnId, shopId: shop.id } });
+  if (!ret) throw new Error("Return not found");
+  if (ret.status !== "OPEN") return { ok: false as const, error: "Only approved (open) returns can be refunded." };
+  if (ret.exchangeUnits > 0) return { ok: false as const, error: "This return is an exchange. Use Complete exchange so the replacement and any leftover refund are handled together." };
+
+  const admin = await getAdmin(shopDomain);
+  const basis = await gql<{ return: { returnLineItems: { nodes: { id?: string; processableQuantity?: number }[] } } | null }>(admin, REFUND_BASIS_QUERY, { id: ret.shopifyId });
+  const items = (basis.return?.returnLineItems.nodes ?? [])
+    .filter((n) => n.id && (n.processableQuantity ?? 0) > 0)
+    .map((n) => ({ id: n.id!, quantity: n.processableQuantity! }));
+  if (!items.length) return { ok: false as const, error: "Nothing left to refund on this return." };
+
+  const suggestion = await gql<{
+    return: {
+      suggestedFinancialOutcome: {
+        financialTransfer: {
+          __typename: string;
+          suggestedTransactions?: { amountSet?: { shopMoney: { amount: string; currencyCode: string } }; parentTransaction?: { id: string } | null }[];
+        } | null;
+      } | null;
+    } | null;
+  }>(admin, REFUND_SUGGEST_QUERY, { id: ret.shopifyId, items });
+
+  const transfer = suggestion.return?.suggestedFinancialOutcome?.financialTransfer;
+  const txs = (transfer?.suggestedTransactions ?? []).filter((t) => t.parentTransaction?.id && t.amountSet);
+  if (transfer?.__typename !== "RefundReturnOutcome" || !txs.length) {
+    return { ok: false as const, error: "Shopify has no refundable payment for this order (for example cash on delivery). Refund it manually in Shopify." };
+  }
+
+  const result = await gql<{ returnProcess: { userErrors: { message: string }[] } }>(admin, PROCESS_RETURN, {
+    input: {
+      returnId: ret.shopifyId,
+      returnLineItems: items,
+      notifyCustomer: true,
+      financialTransfer: {
+        issueRefund: {
+          orderTransactions: txs.map((t) => ({ parentId: t.parentTransaction!.id, transactionAmount: t.amountSet!.shopMoney })),
+        },
+      },
+    },
+  });
+  if (result.returnProcess.userErrors.length) {
+    return { ok: false as const, error: result.returnProcess.userErrors.map((e) => e.message).join(", ") };
+  }
+
+  await ingestReturn(shopDomain, ret.shopifyId, actor, { automate: false });
+  const total = txs.reduce((n, t) => n + Number(t.amountSet!.shopMoney.amount), 0);
+  await addEvent(shop.id, ret.id, {
+    kind: "ACTION",
+    title: "Refund issued",
+    detail: `${txs[0].amountSet!.shopMoney.currencyCode} ${total.toFixed(2)} refunded to the original payment method`,
+    actor,
+  });
+  return { ok: true as const };
+}
+
+const REVERSE_ORDERS_QUERY = `#graphql
+  query ReverseOrders($id: ID!) {
+    return(id: $id) {
+      reverseFulfillmentOrders(first: 5) {
+        nodes {
+          id
+          status
+          lineItems(first: 50) { nodes { id totalQuantity } }
+          reverseDeliveries(first: 5) { nodes { id } }
+        }
+      }
+    }
+  }`;
+
+const CREATE_DELIVERY = `#graphql
+  mutation CreateDelivery($id: ID!, $items: [ReverseDeliveryLineItemInput!]!, $tracking: ReverseDeliveryTrackingInput) {
+    reverseDeliveryCreateWithShipping(reverseFulfillmentOrderId: $id, reverseDeliveryLineItems: $items, trackingInput: $tracking, notifyCustomer: false) {
+      reverseDelivery { id }
+      userErrors { field message }
+    }
+  }`;
+
+const UPDATE_DELIVERY = `#graphql
+  mutation UpdateDelivery($id: ID!, $tracking: ReverseDeliveryTrackingInput) {
+    reverseDeliveryShippingUpdate(reverseDeliveryId: $id, trackingInput: $tracking, notifyCustomer: false) {
+      reverseDelivery { id }
+      userErrors { field message }
+    }
+  }`;
+
+type DeliveryResult = { userErrors: { message: string }[] };
+
+/**
+ * Saves the return shipment's tracking number. It is always stored here; it is also pushed to Shopify's reverse delivery
+ * when the return has an open reverse fulfillment order (approved returns do). A Shopify failure is reported as a
+ * warning and never loses what the merchant typed.
+ */
+export async function saveTracking(
+  shopDomain: string,
+  localReturnId: string,
+  t: { number: string; carrier?: string; url?: string },
+  actor: string,
+) {
+  const shop = await ensureShop(shopDomain);
+  const ret = await db.returnRequest.findFirst({ where: { id: localReturnId, shopId: shop.id } });
+  if (!ret) throw new Error("Return not found");
+  const number = t.number.trim();
+  if (!number) return { ok: false as const, error: "Enter a tracking number." };
+
+  const hadTracking = !!ret.awb;
+  await db.returnRequest.update({
+    where: { id: ret.id },
+    data: { awb: number, carrier: t.carrier?.trim() || null, shipmentStatus: ret.shipmentStatus === "RECEIVED" ? "RECEIVED" : "IN_TRANSIT" },
+  });
+  await addEvent(shop.id, ret.id, {
+    kind: "ACTION",
+    title: hadTracking ? "Tracking updated" : "Tracking added",
+    detail: [t.carrier?.trim(), number].filter(Boolean).join(" · "),
+    actor,
+  });
+
+  let warning: string | undefined;
+  try {
+    const admin = await getAdmin(shopDomain);
+    const data = await gql<{
+      return: {
+        reverseFulfillmentOrders: {
+          nodes: { id: string; status: string; lineItems: { nodes: { id: string; totalQuantity: number }[] }; reverseDeliveries: { nodes: { id: string }[] } }[];
+        };
+      } | null;
+    }>(admin, REVERSE_ORDERS_QUERY, { id: ret.shopifyId });
+    const order = data.return?.reverseFulfillmentOrders.nodes.find((o) => o.status === "OPEN");
+    if (!order) {
+      warning = "Saved here. Shopify has no open reverse shipment for this return yet (approve it first), so nothing was sent to Shopify.";
+    } else {
+      const tracking = { number, url: t.url?.trim() || undefined };
+      const existing = order.reverseDeliveries.nodes[0];
+      const res: DeliveryResult = existing
+        ? (await gql<{ reverseDeliveryShippingUpdate: DeliveryResult }>(admin, UPDATE_DELIVERY, { id: existing.id, tracking })).reverseDeliveryShippingUpdate
+        : (
+            await gql<{ reverseDeliveryCreateWithShipping: DeliveryResult }>(admin, CREATE_DELIVERY, {
+              id: order.id,
+              items: order.lineItems.nodes.map((l) => ({ reverseFulfillmentOrderLineItemId: l.id, quantity: l.totalQuantity })),
+              tracking,
+            })
+          ).reverseDeliveryCreateWithShipping;
+      if (res.userErrors.length) warning = `Saved here, but Shopify said: ${res.userErrors.map((e) => e.message).join(", ")}`;
+    }
+  } catch (err) {
+    warning = `Saved here, but could not reach Shopify: ${err instanceof Error ? err.message : "unknown error"}`;
+  }
+  return { ok: true as const, warning };
+}
+
+/** The merchant confirms the parcel arrived. Tracked in this app (Shopify's own receiving flow needs a stock location). */
+export async function markReceived(shopDomain: string, localReturnId: string, actor: string) {
+  const shop = await ensureShop(shopDomain);
+  const ret = await db.returnRequest.findFirst({ where: { id: localReturnId, shopId: shop.id } });
+  if (!ret) throw new Error("Return not found");
+  await db.returnRequest.update({ where: { id: ret.id }, data: { shipmentStatus: "RECEIVED" } });
+  await addEvent(shop.id, ret.id, { kind: "ACTION", title: "Marked as received", detail: "Return shipment received", actor });
+  return { ok: true as const };
+}
+
+// ---- Exchanges ----
+
+const EXCHANGE_BASIS_QUERY = `#graphql
+  query ExchangeBasis($id: ID!) {
+    return(id: $id) {
+      returnLineItems(first: 100) { nodes { ... on ReturnLineItem { id processableQuantity } } }
+      exchangeLineItems(first: 20) { nodes { id processableQuantity } }
+    }
+  }`;
+
+const EXCHANGE_SUGGEST_QUERY = `#graphql
+  query ExchangeSuggestion($id: ID!, $items: [SuggestedOutcomeReturnLineItemInput!]!, $exchange: [SuggestedOutcomeExchangeLineItemInput!]!) {
+    return(id: $id) {
+      suggestedFinancialOutcome(returnLineItems: $items, exchangeLineItems: $exchange) {
+        financialTransfer {
+          __typename
+          ... on RefundReturnOutcome {
+            amount { shopMoney { amount currencyCode } }
+            suggestedTransactions {
+              ... on SuggestedOrderTransaction { amountSet { shopMoney { amount currencyCode } } parentTransaction { id } }
+            }
+          }
+          ... on InvoiceReturnOutcome { amount { shopMoney { amount currencyCode } } }
+        }
+      }
+    }
+  }`;
+
+type Money = { amount: string; currencyCode: string };
+
+/**
+ * Completes an exchange in one step: hands over the replacement items and, if the returned items are worth more than
+ * the replacements, refunds the leftover to the original payment. If the replacements cost more, nothing is charged
+ * here — the result says how much the customer owes so the merchant can collect it in Shopify.
+ * Never runs on its own: automation skips exchanges, and this only runs when the merchant clicks Complete exchange.
+ */
+export async function completeExchange(shopDomain: string, localReturnId: string, actor: string) {
+  const shop = await ensureShop(shopDomain);
+  const ret = await db.returnRequest.findFirst({ where: { id: localReturnId, shopId: shop.id } });
+  if (!ret) throw new Error("Return not found");
+  if (ret.exchangeUnits <= 0) return { ok: false as const, error: "This return has no exchange items." };
+  if (ret.status !== "OPEN") return { ok: false as const, error: "Approve the return first — only approved (open) exchanges can be completed." };
+
+  const admin = await getAdmin(shopDomain);
+  const basis = await gql<{
+    return: { returnLineItems: { nodes: { id?: string; processableQuantity?: number }[] }; exchangeLineItems: { nodes: { id: string; processableQuantity: number }[] } } | null;
+  }>(admin, EXCHANGE_BASIS_QUERY, { id: ret.shopifyId });
+  const items = (basis.return?.returnLineItems.nodes ?? [])
+    .filter((n) => n.id && (n.processableQuantity ?? 0) > 0)
+    .map((n) => ({ id: n.id!, quantity: n.processableQuantity! }));
+  const exchange = (basis.return?.exchangeLineItems.nodes ?? []).filter((n) => n.processableQuantity > 0).map((n) => ({ id: n.id, quantity: n.processableQuantity }));
+  if (!exchange.length) return { ok: false as const, error: "This exchange is already complete." };
+
+  const suggestion = await gql<{
+    return: {
+      suggestedFinancialOutcome: {
+        financialTransfer: {
+          __typename: string;
+          amount?: { shopMoney: Money };
+          suggestedTransactions?: { amountSet?: { shopMoney: Money }; parentTransaction?: { id: string } | null }[];
+        } | null;
+      } | null;
+    } | null;
+  }>(admin, EXCHANGE_SUGGEST_QUERY, { id: ret.shopifyId, items, exchange });
+
+  const transfer = suggestion.return?.suggestedFinancialOutcome?.financialTransfer;
+  const txs = (transfer?.suggestedTransactions ?? []).filter((t) => t.parentTransaction?.id && t.amountSet);
+  const amount = Number(transfer?.amount?.shopMoney.amount ?? 0);
+  const currencyCode = transfer?.amount?.shopMoney.currencyCode ?? ret.currency ?? "";
+  const refundDue = transfer?.__typename === "RefundReturnOutcome" && amount > 0.005;
+  const owed = transfer?.__typename === "InvoiceReturnOutcome" && amount > 0.005 ? amount : 0;
+
+  if (refundDue && !txs.length) {
+    return { ok: false as const, error: `${currencyCode} ${amount.toFixed(2)} is owed back to the customer, but Shopify has no refundable payment on this order (for example cash on delivery). Settle that in Shopify, then complete the exchange.` };
+  }
+
+  const result = await gql<{ returnProcess: { userErrors: { message: string }[] } }>(admin, PROCESS_RETURN, {
+    input: {
+      returnId: ret.shopifyId,
+      ...(items.length ? { returnLineItems: items } : {}),
+      exchangeLineItems: exchange,
+      notifyCustomer: true,
+      ...(refundDue
+        ? { financialTransfer: { issueRefund: { orderTransactions: txs.map((t) => ({ parentId: t.parentTransaction!.id, transactionAmount: t.amountSet!.shopMoney })) } } }
+        : {}),
+    },
+  });
+  if (result.returnProcess.userErrors.length) {
+    return { ok: false as const, error: result.returnProcess.userErrors.map((e) => e.message).join(", ") };
+  }
+
+  await ingestReturn(shopDomain, ret.shopifyId, actor, { automate: false });
+  const names = ((await db.returnRequest.findUnique({ where: { id: ret.id }, select: { exchangeItems: true } }))?.exchangeItems as { title: string; quantity: number }[] | null) ?? [];
+  const detail = [
+    names.length ? `Replacement: ${names.map((n) => `${n.title} x${n.quantity}`).join(", ")}` : null,
+    refundDue ? `Leftover ${currencyCode} ${amount.toFixed(2)} refunded to the original payment method` : null,
+    owed ? `Customer owes ${currencyCode} ${owed.toFixed(2)}` : null,
+  ].filter(Boolean).join(" · ");
+  await addEvent(shop.id, ret.id, { kind: "ACTION", title: "Exchange completed", detail: detail || undefined, actor });
+
+  const message = [
+    "Exchange completed.",
+    refundDue ? `${currencyCode} ${amount.toFixed(2)} left over was refunded to the original payment method.` : null,
+    owed ? `The customer owes ${currencyCode} ${owed.toFixed(2)} for the price difference — collect it from the order in Shopify.` : null,
+  ].filter(Boolean).join(" ");
+  return { ok: true as const, message };
+}
