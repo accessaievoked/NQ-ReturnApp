@@ -2,6 +2,8 @@ import { Prisma, type ReturnStatus } from "@prisma/client";
 import db from "../db.server";
 import { getAdmin, gql } from "./admin-client.server";
 import { ensureShop } from "./shop.server";
+import { inBackground, notifyReturn } from "./notify.server";
+import { fmtMoney } from "../lib/format";
 
 const RETURN_QUERY = `#graphql
   query ReturnDetail($id: ID!) {
@@ -184,7 +186,7 @@ export async function ingestReturn(
   shopDomain: string,
   returnGid: string,
   source = "Shopify",
-  opts: { automate?: boolean } = {},
+  opts: { automate?: boolean; notify?: boolean } = {},
 ) {
   const shop = await ensureShop(shopDomain);
   const admin = await getAdmin(shopDomain);
@@ -328,6 +330,20 @@ export async function ingestReturn(
           : `Return created in Shopify (already ${saved.status === "OPEN" ? "approved" : saved.status.toLowerCase()})`,
       actor: source,
     });
+  }
+  // Tell the customer about the change (once per event: notifyReturn de-duplicates). Skipped for backfills / lazy
+  // refreshes (automate: false) and when the caller already sent its own email (notify: false).
+  if (opts.automate !== false && opts.notify !== false) {
+    const isExchange = saved.exchangeUnits > 0;
+    if (!existing && saved.status === "REQUESTED") inBackground(notifyReturn(shopDomain, isExchange ? "exchange_received" : "return_received", saved.id));
+    else if (statusChanged && saved.status === "OPEN") inBackground(notifyReturn(shopDomain, isExchange ? "exchange_approved" : "return_approved", saved.id));
+    else if (statusChanged && saved.status === "DECLINED") inBackground(notifyReturn(shopDomain, isExchange ? "exchange_declined" : "return_declined", saved.id));
+  }
+  // Approved from anywhere (this app, an automation rule, or the Shopify admin): book the reverse pickup if the merchant
+  // turned that on. Fire-and-forget — Shiprocket can take longer than the few seconds a Shopify webhook is allowed.
+  if (statusChanged && saved.status === "OPEN" && opts.automate !== false) {
+    const { maybeAutoBookPickup } = await import("./shiprocket.server"); // lazy: shiprocket.server imports this file
+    void maybeAutoBookPickup(shopDomain, saved.id).catch((e) => console.error("Auto pickup failed", e));
   }
   if (!existing && saved.status === "REQUESTED" && opts.automate !== false) {
     const { runAutomations } = await import("./automation.server"); // lazy: automation.server imports this file
@@ -518,6 +534,7 @@ export async function issueRefund(shopDomain: string, localReturnId: string, act
 
   await ingestReturn(shopDomain, ret.shopifyId, actor, { automate: false });
   const total = txs.reduce((n, t) => n + Number(t.amountSet!.shopMoney.amount), 0);
+  inBackground(notifyReturn(shopDomain, "refund_issued", ret.id, { refund_amount: fmtMoney(total, txs[0].amountSet!.shopMoney.currencyCode) }));
   await addEvent(shop.id, ret.id, {
     kind: "ACTION",
     title: "Refund issued",
@@ -627,6 +644,7 @@ export async function markReceived(shopDomain: string, localReturnId: string, ac
   const ret = await db.returnRequest.findFirst({ where: { id: localReturnId, shopId: shop.id } });
   if (!ret) throw new Error("Return not found");
   await db.returnRequest.update({ where: { id: ret.id }, data: { shipmentStatus: "RECEIVED" } });
+  inBackground(notifyReturn(shopDomain, "return_delivered", ret.id));
   await addEvent(shop.id, ret.id, { kind: "ACTION", title: "Marked as received", detail: "Return shipment received", actor });
   return { ok: true as const };
 }
@@ -729,6 +747,7 @@ export async function completeExchange(shopDomain: string, localReturnId: string
     refundDue ? `Leftover ${currencyCode} ${amount.toFixed(2)} refunded to the original payment method` : null,
     owed ? `Customer owes ${currencyCode} ${owed.toFixed(2)}` : null,
   ].filter(Boolean).join(" · ");
+  inBackground(notifyReturn(shopDomain, "exchange_completed", ret.id, { refund_amount: refundDue ? fmtMoney(amount, currencyCode) : "" }));
   await addEvent(shop.id, ret.id, { kind: "ACTION", title: "Exchange completed", detail: detail || undefined, actor });
 
   const message = [

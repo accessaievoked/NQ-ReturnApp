@@ -5,6 +5,7 @@ import { Form, Link, useActionData, useLoaderData, useNavigation, useSubmit } fr
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import { ensureShop } from "../services/shop.server";
+import { bookReturnPickup, cancelReturnPickup } from "../services/shiprocket.server";
 import { addEvent, completeExchange, ingestReturn, issueRefund, markReceived, performReturnAction, saveTracking, type ReturnAction } from "../services/returns.server";
 import { convert, currencyContext, publicCurrency } from "../services/currency.server";
 import { saveCurrency } from "../lib/currency-pref";
@@ -39,6 +40,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const cx = await currencyContext(shop, new URL(request.url).searchParams.get("cur"));
   const from = ret.currency ?? cx.base;
   const money = (v: unknown) => (v == null ? null : convert(Number(v), from, cx.display, cx.rates));
+  const shiprocket = await db.shiprocketConnection.findUnique({ where: { shopId: shop.id }, select: { connected: true } });
   const refundStatus = refundStatusOf({ status: ret.status, returnValue: Number(ret.returnValue), refundedAmount: Number(ret.refundedAmount), exchangeUnits: ret.exchangeUnits });
   const exchangeItems = ((ret.exchangeItems as ExchangeItem[] | null) ?? []).map((e) => ({ ...e, unitPrice: money(e.unitPrice) ?? 0 }));
   return {
@@ -54,6 +56,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     exchangeStatus: exchangeStatusOf(ret),
     shopDomain: session.shop,
     currency: publicCurrency(cx),
+    shiprocketConnected: !!shiprocket?.connected,
   };
 };
 
@@ -64,6 +67,8 @@ const SUCCESS: Record<string, string> = {
   reopen: "Return reopened.",
   refund: "Refund issued through Shopify. The customer has been notified.",
   exchange: "Exchange completed.",
+  "book-pickup": "Reverse pickup booked.",
+  "cancel-pickup": "Pickup canceled.",
   tracking: "Tracking saved.",
   received: "Marked as received.",
   note: "Note added.",
@@ -83,6 +88,8 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       if (note) await addEvent(shop.id, id, { kind: "NOTE", title: "Note", detail: note, actor });
       return { ok: true as const, intent };
     }
+    if (intent === "book-pickup") return { intent, ...(await bookReturnPickup(session.shop, id, actor)) };
+    if (intent === "cancel-pickup") return { intent, ...(await cancelReturnPickup(session.shop, id, actor)) };
     if (intent === "exchange") return { intent, ...(await completeExchange(session.shop, id, actor)) };
     if (intent === "refund") return { intent, ...(await issueRefund(session.shop, id, actor)) };
     if (intent === "received") return { intent, ...(await markReceived(session.shop, id, actor)) };
@@ -116,7 +123,7 @@ function Row({ k, children }: { k: string; children: ReactNode }) {
 }
 
 export default function ReturnDetail() {
-  const { ret, refundStatus, exchangeStatus, shopDomain, currency } = useLoaderData<typeof loader>();
+  const { ret, refundStatus, exchangeStatus, shopDomain, currency, shiprocketConnected } = useLoaderData<typeof loader>();
   const result = useActionData<typeof action>();
   const submit = useSubmit();
   const busy = useNavigation().state !== "idle";
@@ -135,6 +142,7 @@ export default function ReturnDetail() {
   const address = ret.shippingAddress as Record<string, string | null> | null;
   const itemsCost = ret.items.reduce((n, i) => n + Number(i.unitPrice ?? 0) * i.quantity, 0);
   const first = ret.items[0];
+  const scans = (Array.isArray(ret.trackingScans) ? ret.trackingScans : []) as { date: string | null; status: string | null; activity: string | null; location: string | null }[];
   const isExchange = ret.exchangeUnits > 0;
   const replacements = ret.exchangeItems;
   const replacementValue = replacements.reduce((n, e) => n + e.unitPrice * e.quantity, 0);
@@ -228,6 +236,16 @@ export default function ReturnDetail() {
                     Issue refund
                   </button>
                 )}
+                {shiprocketConnected && !ret.awb && ret.shipmentStatus !== "RECEIVED" && (
+                  <button style={btn("secondary", busy)} disabled={busy} onClick={() => send("book-pickup")}>
+                    {ret.pickupError && ret.pickupError !== "BOOKING" ? "Retry pickup" : "Book pickup"}
+                  </button>
+                )}
+                {ret.srOrderId && ret.awb && ret.shipmentStatus === "AWAITING_SHIPMENT" && (
+                  <button style={btn("secondary", busy)} disabled={busy} onClick={() => window.confirm("Cancel the booked pickup?") && send("cancel-pickup")}>
+                    Cancel pickup
+                  </button>
+                )}
                 <button style={btn("secondary", busy)} disabled={busy} onClick={() => setEditingTracking((v) => !v)}>
                   {ret.awb ? "Edit tracking" : "Add tracking"}
                 </button>
@@ -264,6 +282,9 @@ export default function ReturnDetail() {
         </div>
         <CurrencyNote currency={currency} />
         {banner}
+        {ret.pickupError && ret.pickupError !== "BOOKING" && ret.status === "OPEN" && (
+          <s-banner tone="warning" heading="The courier pickup could not be booked">{ret.pickupError}</s-banner>
+        )}
 
         {/* progress */}
         <div style={{ ...cardStyle, display: "flex", alignItems: "flex-start", overflowX: "auto" }}>
@@ -318,7 +339,9 @@ export default function ReturnDetail() {
               title="Return shipment"
               right={ship ? <s-badge tone={ship.tone}>{ship.label}</s-badge> : <span style={sub}>Not shipped yet</span>}
             >
+              <Row k="Courier status">{ret.carrierStatus ?? <span style={{ color: COLORS.subdued }}>—</span>}</Row>
               <Row k="Carrier">{ret.carrier ?? "—"}</Row>
+              {ret.pickupScheduledAt && <Row k="Pickup scheduled">{fmtDate(ret.pickupScheduledAt)}</Row>}
               <Row k="AWB / tracking number">
                 {ret.awb ? (
                   <a href={trackingUrl(ret.awb)} target="_blank" rel="noreferrer">{ret.awb} ↗</a>
@@ -326,6 +349,19 @@ export default function ReturnDetail() {
                   <span style={{ color: COLORS.subdued }}>Not added</span>
                 )}
               </Row>
+              {scans.length > 0 && (
+                <details style={{ paddingTop: 10 }}>
+                  <summary style={{ cursor: "pointer", fontSize: 13, fontWeight: 600 }}>Courier timeline ({scans.length})</summary>
+                  <div style={{ display: "grid", gap: 6, paddingTop: 8 }}>
+                    {[...scans].reverse().map((sc, i) => (
+                      <div key={i} style={{ borderLeft: `3px solid ${COLORS.grey}`, padding: "1px 10px", fontSize: 13 }}>
+                        <strong>{sc.status ?? sc.activity ?? "Update"}</strong>
+                        <div style={sub}>{[sc.activity !== sc.status ? sc.activity : null, sc.location, sc.date].filter(Boolean).join(" · ")}</div>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
               {ret.status === "OPEN" && !editingTracking && (
                 <div style={{ paddingTop: 10 }}>
                   <button style={btn("secondary", busy)} disabled={busy} onClick={() => setEditingTracking(true)}>{ret.awb ? "Edit tracking" : "Add tracking"}</button>

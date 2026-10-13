@@ -1,0 +1,33 @@
+api_version = "2026-07"
+
+[[extensions]]
+name = "Return button"
+handle = "return-button"
+uid = "69f8e4f6-5f64-d6fa-1396-16fae58218672328f1f1"
+type = "ui_extension"
+
+  # Where it can go: the customer's order page. The merchant adds it in Settings → Customer accounts → Customize.
+  [[extensions.targeting]]
+  module = "./src/ReturnButton.jsx"
+  target = "customer-account.order-status.block.render"
+
+  # The texts are editable in the customer accounts editor, so a merchant can rename the button without touching code.
+  [extensions.settings]
+
+    [[extensions.settings.fields]]
+    key = "heading"
+    type = "single_line_text_field"
+    name = "Heading"
+    description = "Shown above the button."
+
+    [[extensions.settings.fields]]
+    key = "description"
+    type = "multi_line_text_field"
+    name = "Description"
+    description = "A short line under the heading."
+
+    [[extensions.settings.fields]]
+    key = "button_label"
+    type = "single_line_text_field"
+    name = "Button label"
+    description = "Text on the button."

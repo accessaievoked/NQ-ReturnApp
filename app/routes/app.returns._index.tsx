@@ -7,6 +7,7 @@ import db from "../db.server";
 import { ensureShop } from "../services/shop.server";
 import { listReturns } from "../services/returns-query.server";
 import { performReturnAction, syncAllReturns } from "../services/returns.server";
+import { approveExchangeRequest, declineExchangeRequest } from "../services/portal.server";
 import { currencyContext, publicCurrency } from "../services/currency.server";
 import { downloadCsv } from "../lib/csv";
 import { saveCurrency } from "../lib/currency-pref";
@@ -21,7 +22,24 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const filters = parseReturnFilters(new URL(request.url).searchParams);
   const cx = await currencyContext(shop, filters.cur);
   const data = await listReturns(shop.id, filters, cx);
-  return { ...data, filters, currency: publicCurrency(cx), now: Date.now() };
+  // Exchanges asked for on the storefront form wait in their own table until approved (see portal.server.ts). Show them
+  // here too so they can be handled without leaving Returns — on the first page, and only for views that include "requested".
+  const showPending = filters.page === 1 && (filters.status === null || filters.status === "REQUESTED");
+  const pending = showPending ? await db.exchangeRequest.findMany({ where: { shopId: shop.id, status: "PENDING" }, orderBy: { createdAt: "asc" }, take: 20 }) : [];
+  const pendingExchanges = pending.map((r) => ({
+    id: r.id,
+    code: r.code,
+    orderName: r.orderName,
+    email: r.customerEmail,
+    createdAt: r.createdAt.toISOString(),
+    currency: r.currency,
+    returning: (r.items as unknown as { title: string; variantTitle: string | null; quantity: number }[]).map((i) => `${i.title}${i.variantTitle ? ` (${i.variantTitle})` : ""} ×${i.quantity}`),
+    taking: (r.replacements as unknown as { title: string; variantTitle: string | null; quantity: number }[]).map((i) => `${i.title}${i.variantTitle ? ` (${i.variantTitle})` : ""} ×${i.quantity}`),
+    diff: Number(r.returnValue) - Number(r.replacementValue),
+    flags: (r.flags as unknown as string[] | null) ?? [],
+    photos: (r.items as unknown as { photos?: string[] }[]).flatMap((i) => i.photos ?? []).length,
+  }));
+  return { ...data, filters, currency: publicCurrency(cx), now: Date.now(), pendingExchanges };
 };
 
 const NEEDS: Record<string, "REQUESTED" | "OPEN"> = { approve: "REQUESTED", decline: "REQUESTED", close: "OPEN" };
@@ -38,6 +56,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const n = await syncAllReturns(session.shop);
     return { done: n, failed: 0, skipped: 0, errors: [] as string[], synced: true };
   }
+
+  if (intent === "approve-exchange") return { exchange: "approved" as const, ...(await approveExchangeRequest(session.shop, String(form.get("id") ?? ""), session.shop)) };
+  if (intent === "decline-exchange") return { exchange: "declined" as const, ...(await declineExchangeRequest(session.shop, String(form.get("id") ?? ""), String(form.get("note") ?? "") || null)) };
 
   const ids = String(form.get("ids") ?? "").split(",").filter(Boolean).slice(0, 50);
   if (!(intent in NEEDS) || !ids.length) return { done: 0, failed: 0, skipped: 0, errors: [] as string[] };
@@ -96,7 +117,8 @@ function Menu({ label, children, disabled }: { label: ReactNode; children: React
 }
 
 export default function Returns() {
-  const { rows, pagination, statusCounts, allCount, reasons, filters: f, currency, now } = useLoaderData<typeof loader>();
+  const { rows, pagination, statusCounts, allCount, reasons, filters: f, currency, now, pendingExchanges } = useLoaderData<typeof loader>();
+  const xf = useFetcher<typeof action>(); // approve / decline for the exchange panel
   const submit = useSubmit();
   const nav = useNavigation();
   const bulk = useFetcher<typeof action>();
@@ -119,6 +141,8 @@ export default function Returns() {
   const chosenRows = rows.filter((r) => selected.has(r.id));
   const count = (st: string) => chosenRows.filter((r) => r.status === st).length;
   const busy = bulk.state !== "idle";
+  const xBusy = xf.state !== "idle";
+  const xr = xf.data && "exchange" in xf.data ? xf.data : null;
   const autoSubmit = (e: React.ChangeEvent<HTMLSelectElement | HTMLInputElement>) => e.currentTarget.form && submit(e.currentTarget.form);
   const allOnPage = rows.length > 0 && chosenRows.length === rows.length;
 
@@ -151,6 +175,54 @@ export default function Returns() {
             </button>
           </bulk.Form>
         </div>
+
+        {xr && !xr.ok && <s-banner tone="critical" dismissible>{"error" in xr ? xr.error : "Could not update that exchange request."}</s-banner>}
+        {xr && xr.ok && <s-banner tone="success" dismissible>Exchange request {xr.exchange}.</s-banner>}
+
+        {pendingExchanges.length > 0 && (
+          <div style={{ ...cardStyle, borderColor: "#f1c40f", background: "#fffdf3" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+              <strong style={{ fontSize: 15 }}>Exchange requests waiting for you ({pendingExchanges.length})</strong>
+              <Link to="/app/requests" style={{ fontSize: 13 }}>Open the full list</Link>
+            </div>
+            <div style={{ display: "grid", gap: 8 }}>
+              {pendingExchanges.map((x) => (
+                <div key={x.id} style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", padding: "10px 0", borderTop: `1px solid ${COLORS.border}` }}>
+                  <div style={{ flex: "1 1 320px", minWidth: 0 }}>
+                    <div style={{ fontSize: 14 }}>
+                      <strong>{x.code}</strong> · {x.orderName} · <span style={{ color: COLORS.subdued }}>{x.email}</span> <span style={sub}>{fmtDate(x.createdAt)}</span>
+                    </div>
+                    <div style={{ fontSize: 13 }}>{x.returning.join(", ")} <span style={{ color: COLORS.subdued }}>⇄</span> {x.taking.join(", ")}</div>
+                    <div style={sub}>
+                      {Math.abs(x.diff) < 0.005 ? "Even exchange" : x.diff > 0 ? `${fmtMoney(x.diff, x.currency)} left over (refunded on completion)` : `Customer pays ${fmtMoney(-x.diff, x.currency)} more`}
+                      {x.photos > 0 ? ` · ${x.photos} photo${x.photos === 1 ? "" : "s"}` : ""}
+                      {x.flags.length > 0 ? ` · ⚠ ${x.flags.join(", ")}` : ""}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      style={btn("primary", xBusy)}
+                      disabled={xBusy}
+                      onClick={() => window.confirm(`Approve exchange ${x.code}? This creates the exchange in Shopify.`) && xf.submit({ intent: "approve-exchange", id: x.id }, { method: "post" })}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      style={btn("danger", xBusy)}
+                      disabled={xBusy}
+                      onClick={() => {
+                        const note = window.prompt("Reason for declining (the customer can see this when they check their request):");
+                        if (note !== null) xf.submit({ intent: "decline-exchange", id: x.id, note }, { method: "post" });
+                      }}
+                    >
+                      Decline
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {bulk.data && (
           <s-banner tone={bulk.data.failed ? "warning" : "success"} dismissible>

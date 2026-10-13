@@ -36,6 +36,11 @@ api_version = "2026-07"
   uri = "/webhooks/products"
   topics = [ "products/create", "products/update", "products/delete" ]
 
+[app_proxy]
+url = "https://example.com/proxy"
+subpath = "returns"
+prefix = "apps"
+
 [auth]
 redirect_urls = [ "https://example.com/api/auth" ]
 

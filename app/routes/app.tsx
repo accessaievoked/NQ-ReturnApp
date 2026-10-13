@@ -13,10 +13,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   // Returns still waiting for a decision — drives the alert pill shown on every page.
   const shop = await ensureShop(session.shop);
-  const unresolved = await db.returnRequest.count({ where: { shopId: shop.id, status: "REQUESTED" } });
+  const [pendingReturns, pendingExchanges] = await Promise.all([
+    db.returnRequest.count({ where: { shopId: shop.id, status: "REQUESTED" } }),
+    db.exchangeRequest.count({ where: { shopId: shop.id, status: "PENDING" } }), // exchanges asked for on the storefront form
+  ]);
+  const unresolved = pendingReturns + pendingExchanges;
 
   // eslint-disable-next-line no-undef
-  return { apiKey: process.env.SHOPIFY_API_KEY || "", unresolved };
+  return { apiKey: process.env.SHOPIFY_API_KEY || "", unresolved, reviewUrl: pendingReturns > 0 ? "/app/returns?status=REQUESTED" : "/app/requests" };
 };
 
 /** Re-applies the browser-remembered display currency (`?cur=`) when navigating between pages that support it. */
@@ -34,7 +38,7 @@ function CurrencySync() {
 }
 
 export default function App() {
-  const { apiKey, unresolved } = useLoaderData<typeof loader>();
+  const { apiKey, unresolved, reviewUrl } = useLoaderData<typeof loader>();
 
   return (
     <AppProvider apiKey={apiKey}>
@@ -43,6 +47,11 @@ export default function App() {
         <s-link href="/app/returns">Returns</s-link>
         <s-link href="/app/analytics">Analytics</s-link>
         <s-link href="/app/automation">Automation</s-link>
+        <s-link href="/app/requests">Exchange requests</s-link>
+        <s-link href="/app/portal">Return form</s-link>
+        <s-link href="/app/form-editor">Form design</s-link>
+        <s-link href="/app/emails">Emails</s-link>
+        <s-link href="/app/shipping">Shipping</s-link>
         <s-link href="/app/products">Products</s-link>
         <s-link href="/app/settings">Settings</s-link>
       </s-app-nav>
@@ -50,7 +59,7 @@ export default function App() {
       {unresolved > 0 && (
         <div style={{ display: "flex", justifyContent: "flex-end", padding: "8px 16px 0" }}>
           <Link
-            to="/app/returns?status=REQUESTED"
+            to={reviewUrl}
             title="Open the returns that are waiting for your decision"
             style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#fbeae5", color: "#b4331a", border: "1px solid #f5c6bb", borderRadius: 20, padding: "5px 14px 5px 10px", fontSize: 13, fontWeight: 600, textDecoration: "none" }}
           >

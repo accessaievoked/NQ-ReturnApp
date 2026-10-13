@@ -45,6 +45,14 @@ model Shop {
   events   ReturnEvent[]
   rules    AutomationRule[]
   runs     AutomationRun[]
+  shiprocket ShiprocketConnection?
+  portalSettings  PortalSettings?
+  exchangeRequests ExchangeRequest[]
+  portalUploads    PortalUpload[]
+  emailSettings    EmailSettings?
+  emailTemplates   EmailTemplate[]
+  emailLogs        EmailLog[]
+  returnFormTheme  ReturnFormTheme?
 }
 
 model Product {
@@ -119,6 +127,12 @@ model ReturnRequest {
   shipmentStatus  String? // AWAITING_SHIPMENT | IN_TRANSIT | RECEIVED | CANCELED (from reverse fulfillment orders)
   awb             String? // return-shipment tracking number
   carrier         String?
+  srOrderId         String? // Shiprocket order id of the reverse shipment we booked
+  srShipmentId      String?
+  carrierStatus     String? // latest courier status text from Shiprocket, e.g. "PICKED UP"
+  pickupScheduledAt DateTime?
+  pickupError       String? // why booking the pickup failed (shown to the merchant, cleared on success)
+  trackingScans     Json? // latest courier scans: [{ date, status, activity, location }]
   requestedAt     DateTime
   closedAt        DateTime?
   createdAt       DateTime     @default(now())
@@ -133,6 +147,7 @@ model ReturnRequest {
   @@index([shopId, status])
   @@index([shopId, requestedAt])
   @@index([shopId, customerEmail])
+  @@index([awb])
 }
 
 model ReturnItem {
@@ -225,4 +240,177 @@ model AutomationRun {
   return ReturnRequest   @relation(fields: [returnId], references: [id], onDelete: Cascade)
 
   @@index([shopId, createdAt])
+}
+
+// One Shiprocket account per shop. Credentials are stored encrypted (see services/crypto.server.ts).
+model ShiprocketConnection {
+  id             String    @id @default(cuid())
+  shopId         String    @unique
+  publicId       String    @unique // identifies the shop in the webhook URL
+  webhookSecret  String // Shiprocket sends this back as the x-api-key header
+  email          String? // the Shiprocket *API user* email
+  passwordEnc    String?
+  tokenEnc       String?
+  tokenExpiresAt DateTime?
+  connected      Boolean   @default(false)
+
+  // where returned parcels are delivered (the merchant's warehouse)
+  whName     String?
+  whAddress  String?
+  whAddress2 String?
+  whCity     String?
+  whState    String?
+  whPincode  String?
+  whPhone    String?
+  whEmail    String?
+  whCountry  String  @default("India")
+
+  // default parcel used for every reverse pickup
+  parcelLength  Float @default(10)
+  parcelBreadth Float @default(10)
+  parcelHeight  Float @default(10)
+  parcelWeight  Float @default(0.5)
+
+  // what runs without a click once a return is approved
+  autoPickup  Boolean @default(false) // book the reverse pickup on approval
+  autoReceive Boolean @default(true) // mark the return received when the courier delivers it
+  autoRefund  Boolean @default(false) // refund prepaid returns / complete exchanges once received
+
+  lastWebhookAt DateTime?
+  lastError     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+}
+
+// What the customer-facing return/exchange form allows. Enforced on the server, never trusted from the browser.
+model PortalSettings {
+  id               String  @id @default(cuid())
+  shopId           String  @unique
+  enabled          Boolean @default(true)
+  allowReturns     Boolean @default(true)
+  allowExchanges   Boolean @default(true)
+  exchangeMode     String  @default("VARIANT") // VARIANT = other sizes/colours of the same product, ANY = any product
+  windowDays       Int     @default(30) // days after delivery
+  nonReturnableTag String  @default("final-sale") // products with this tag can't be returned
+  requireNote      Boolean @default(false)
+  notice           String? // optional message at the top of the form
+  photoMode        String  @default("OPTIONAL") // OFF | OPTIONAL | REQUIRED — customer photos of each returned item
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+}
+
+enum PortalRequestStatus {
+  PENDING
+  APPROVED
+  DECLINED
+}
+
+// An exchange asked for through the form. Held here until the merchant approves it, because Shopify can only create an
+// exchange as an already-approved return. On approval it becomes a real Shopify return (see portal.server.ts).
+model ExchangeRequest {
+  id               String              @id @default(cuid())
+  shopId           String
+  code             String // customer-facing reference, e.g. EX-7K2QX
+  orderGid         String
+  orderName        String
+  customerName     String?
+  customerEmail    String
+  status           PortalRequestStatus @default(PENDING)
+  items            Json // returning: [{ fulfillmentLineItemId, title, variantTitle, imageUrl, quantity, unitPrice, reasonId, reasonName, note }]
+  replacements     Json // taking:    [{ forKey, variantId, title, variantTitle, imageUrl, quantity, unitPrice }]
+  returnValue      Decimal             @db.Decimal(12, 2)
+  replacementValue Decimal             @db.Decimal(12, 2)
+  currency         String?
+  flags            Json? // risk hints for the merchant, e.g. ["3 returns in 90 days"]
+  declineNote      String?
+  returnId         String? // local ReturnRequest created on approval
+  createdAt        DateTime            @default(now())
+  decidedAt        DateTime?
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, code])
+  @@index([shopId, status, createdAt])
+}
+
+// A photo a customer attached on the return form. Stored in the database (resized in the browser first, so each is a few
+// hundred KB) and served through a signed URL (see routes/media.$id.tsx). Unclaimed uploads are deleted after a day.
+model PortalUpload {
+  id        String   @id @default(cuid())
+  shopId    String
+  mime      String
+  size      Int
+  data      Bytes
+  claimed   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, claimed, createdAt])
+}
+
+// Look and sender details shared by every customer email of a shop.
+model EmailSettings {
+  id         String  @id @default(cuid())
+  shopId     String  @unique
+  fromName   String? // display name; the address itself is the SMTP account
+  replyTo    String?
+  brandColor String  @default("#3b3fe0")
+  logoUrl    String?
+  footer     String?
+  portalUrl  String? // link to the page holding the return form, offered in emails as {{form_url}}
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+}
+
+// A merchant's edit of one email. No row = the built-in default (lib/email-defaults.ts).
+model EmailTemplate {
+  id        String   @id @default(cuid())
+  shopId    String
+  event     String // e.g. exchange_approved
+  enabled   Boolean  @default(true)
+  subject   String
+  body      String // HTML with {{variables}}
+  wrap      Boolean  @default(true) // wrap in the branded header/footer layout
+  updatedAt DateTime @updatedAt
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, event])
+}
+
+// Every email we tried to send. `dedupeKey` stops the same event emailing a customer twice (webhooks re-deliver).
+model EmailLog {
+  id        String   @id @default(cuid())
+  shopId    String
+  event     String
+  toEmail   String
+  subject   String
+  status    String // SENT | FAILED | LOGGED (SMTP not configured)
+  error     String?
+  dedupeKey String?
+  createdAt DateTime @default(now())
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, dedupeKey])
+  @@index([shopId, createdAt])
+}
+
+// The customer-facing return/exchange form of ONE store: its markup, its CSS and a few selectable style options.
+// Same idea as Judge.me's ReviewFormTheme. No row = the built-in defaults in lib/return-form-template.ts.
+//  - `html` uses {{tokens}} and <!--BLOCK-->…<!--/BLOCK--> markers (documented in that file and in the editor); the form's
+//    behaviour is wired to fixed data-er-* attributes, so merchants can restyle and rearrange freely.
+//  - `style` holds the simple options (colours, radius, font size, button shape…) the merchant sets without touching code.
+model ReturnFormTheme {
+  id        String   @id @default(cuid())
+  shopId    String   @unique
+  html      String
+  css       String
+  style     Json?
+  updatedAt DateTime @updatedAt
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
 }
