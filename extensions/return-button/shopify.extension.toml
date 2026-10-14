@@ -11,6 +11,16 @@ type = "ui_extension"
   module = "./src/ReturnButton.jsx"
   target = "customer-account.order-status.block.render"
 
+  # A button in every order's action row (orders list and order page), next to "Pay now" / "Buy again".
+  [[extensions.targeting]]
+  module = "./src/ReturnAction.jsx"
+  target = "customer-account.order.action.menu-item.render"
+
+  # Above the ORDERS LIST: a visible button that opens the returns page (customer types order number + email).
+  [[extensions.targeting]]
+  module = "./src/ReturnLink.jsx"
+  target = "customer-account.order-index.block.render"
+
   # The texts are editable in the customer accounts editor, so a merchant can rename the button without touching code.
   [extensions.settings]
 

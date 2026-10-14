@@ -64,7 +64,19 @@ export default function Portal() {
       <div style={{ display: "grid", gap: 16 }}>
         {result?.ok && <s-banner tone="success" dismissible>Form settings saved.</s-banner>}
 
-        <Card title="Add a “Return or exchange” button to your customers&apos; orders">
+        <Card title="1 · A returns page anyone can open">
+          <p style={{ margin: "0 0 8px", fontSize: 14 }}>
+            Customers type their order number and email, then see the form. Add this link to your store menu, footer or order emails:
+          </p>
+          <code style={{ display: "block", padding: "10px 12px", background: "#f6f6f7", borderRadius: 8, fontSize: 13, wordBreak: "break-all" }}>
+            https://{store}/apps/returns/form
+          </code>
+          <p style={{ margin: "8px 0 0", fontSize: 13, color: COLORS.subdued }}>
+            Use your storefront domain if it differs from the one shown. A link ending in <code>?order=1089</code> fills the order number in for them.
+          </p>
+        </Card>
+
+        <Card title="2 · A button on each order that opens the form already filled in">
           <ol style={{ margin: 0, paddingLeft: 20, display: "grid", gap: 8, fontSize: 14 }}>
             <li>
               Open the customer accounts editor: Shopify admin → <strong>Settings → Customer accounts → Customize</strong> (or open it from{" "}
@@ -77,8 +89,7 @@ export default function Portal() {
             </li>
           </ol>
           <p style={{ margin: "12px 0 0", fontSize: 13, color: COLORS.subdued }}>
-            Not using the new customer accounts? Link to <code>https://{store}/apps/returns/form?order=&lt;order number&gt;</code> from anywhere (for example your order emails);
-            the customer is asked to confirm the order&apos;s email.
+            Not using the new customer accounts? Use the returns page link above instead.
           </p>
         </Card>
 

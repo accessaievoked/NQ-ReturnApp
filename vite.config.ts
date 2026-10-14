@@ -43,6 +43,8 @@ export default defineConfig({
     },
     port: Number(process.env.PORT || 3000),
     hmr: hmrConfig,
+    // The Shopify CLI rewrites extension bundles in .shopify/ while `dev` runs; on Windows watching them crashes with EBUSY.
+    watch: { ignored: ["**/.shopify/**", "**/extensions/**/dist/**"] },
     fs: {
       // See https://vitejs.dev/config/server-options.html#server-fs-allow for more information
       allow: ["app", "node_modules"],

@@ -10,6 +10,7 @@
 //   {{requests}}         (raw HTML) the customer's earlier requests for this order and their status
 //   {{hiddenFields}}     (raw HTML) hidden inputs the email-confirmation form needs
 //   {{verifyError}}      why the email confirmation failed (empty otherwise)
+//   {{lookupOrder}} {{lookupEmail}} {{lookupError}}   what the customer typed on the "find your order" screen, and why it failed
 //   inside <!--ITEM-->:  {{itemKey}} {{itemTitle}} {{itemVariant}} {{itemPrice}} {{itemDetail}} {{itemImageUrl}}
 //                        {{itemReason}} (why it can't be returned) {{itemStateClass}} {{itemDisabledAttr}} {{itemMax}}
 //                        {{qtyOptions}} {{reasonOptions}} {{exchangeOptions}}  (the three are raw <option> lists)
@@ -17,6 +18,7 @@
 //
 // ── Blocks (<!--NAME-->…<!--/NAME-->; shown only when the condition holds) ──────────────────────────────────────
 //   NOTICE   the store has a message        VERIFY   the customer must confirm their email first
+//   LOOKUP   "find your order" (order number + email) — shown when the page is opened without an order
 //   FORM     the order is verified          REQUESTS the order already has requests
 //   ITEM     repeated once per order item   EMPTY    nothing on the order can be returned
 //   inside ITEM: IMAGE (has a picture) · QTY (more than 1 unit) · PHOTOS (photos allowed) · EXCHANGE (replacements exist)
@@ -44,6 +46,8 @@ export type FormData = {
   daysLeftText: string;
   notice: string | null;
   verify: { needed: boolean; error?: string; orderParam?: string };
+  /** The "find your order" screen: the page was opened from a link, not from an order's button. */
+  lookup?: { needed: boolean; error?: string; order?: string; email?: string };
   items: FormItem[];
   reasons: { id: string; name: string }[];
   allowReturns: boolean;
@@ -63,11 +67,14 @@ const option = (value: string, label: string) => `<option value="${escapeHtml(va
 
 export function renderReturnForm(template: string, d: FormData): string {
   const anyExchange = d.allowExchanges && d.items.some((i) => i.eligible && i.exchange.length > 0);
-  const formVisible = !d.verify.needed;
+  const lookup = !!d.lookup?.needed;
+  const formVisible = !d.verify.needed && !lookup;
 
-  let out = template;
+  // templates saved before the lookup screen existed don't have the block: add it in front of the email check
+  let out = template.includes("<!--LOOKUP-->") ? template : template.replace("<!--VERIFY-->", `${LOOKUP_BLOCK}<!--VERIFY-->`);
   out = block(out, "NOTICE", !!d.notice);
-  out = block(out, "VERIFY", d.verify.needed);
+  out = block(out, "LOOKUP", lookup);
+  out = block(out, "VERIFY", d.verify.needed && !lookup);
   out = block(out, "FORM", formVisible);
   out = block(out, "REQUESTS", !!d.requestsHtml);
   out = block(out, "EMPTY", formVisible && d.items.length === 0);
@@ -111,7 +118,32 @@ export function renderReturnForm(template: string, d: FormData): string {
     requests: d.requestsHtml, // already escaped when it was built
     hiddenFields: `<input type="hidden" name="${d.verify.orderParam ?? "id"}" value="${escapeHtml(d.orderId)}">`,
     verifyError: escapeHtml(d.verify.error ?? ""),
+    lookupOrder: escapeHtml(d.lookup?.order ?? ""),
+    lookupEmail: escapeHtml(d.lookup?.email ?? ""),
+    lookupError: escapeHtml(d.lookup?.error ?? ""),
   });
+}
+
+/** The whole page a customer receives (storefront and the admin preview both use this, so they can't drift apart). */
+export function buildFormDocument(p: { body: string; css: string; style: FormStyle; orderName: string; orderId: string; email: string; photoMode: FormData["photoMode"]; requireNote: boolean; script: string; preview?: string }): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Return or exchange${p.orderName ? ` · ${escapeHtml(p.orderName)}` : ""}</title>
+<style>body{margin:0;background:#fff}
+${p.css}
+${compileStyle(p.style)}</style>
+</head>
+<body>
+<div class="er-root" data-order-id="${escapeHtml(p.orderId)}" data-email="${escapeHtml(p.email)}" data-photo-mode="${p.photoMode}" data-require-note="${p.requireNote}">
+${p.body}
+</div>
+${p.preview ?? ""}<script>${p.script}</script>
+</body>
+</html>`;
 }
 
 /** The pieces a template must keep, or the form can't work. Checked when a merchant saves their HTML. */
@@ -174,15 +206,29 @@ export function normalizeStyle(raw: unknown): FormStyle {
 export function compileStyle(s: FormStyle): string {
   const btn = s.button === "pill" ? "999px" : s.button === "rounded" ? `${s.radius}px` : "4px";
   return `.er-root{--er-accent:${s.accent};--er-accent-text:${s.accentText};--er-page:${s.page};--er-card:${s.card};--er-text:${s.text};--er-radius:${s.radius}px;--er-font:${s.fontSize}px;--er-btn-radius:${btn};--er-width:${s.width}px;}
-.er-root{margin-left:${s.align === "center" ? "auto" : "0"};margin-right:auto;}`;
+.er-root{margin-left:${s.align === "center" ? "auto" : "0"};margin-right:auto;}
+.er-root .er-verify{display:grid;gap:14px}`;
 }
 
 // ──────────────────────────────────────────────────────────────── defaults
+
+const LOOKUP_BLOCK = `<!--LOOKUP-->
+  <h1 class="er-h1" tabindex="-1">Find your order</h1>
+  <p class="er-sub">Enter your order number and the email address you used to place it.</p>
+  <form method="get" class="er-verify">
+    <label class="er-field"><span>Order number</span><input class="er-input" type="text" name="order" value="{{lookupOrder}}" placeholder="#1001" required inputmode="numeric" autocomplete="off"></label>
+    <label class="er-field"><span>Email</span><input class="er-input" type="email" name="email" value="{{lookupEmail}}" required autocomplete="email"></label>
+    <p class="er-error" role="alert">{{lookupError}}</p>
+    <button type="submit" class="er-btn">Find my order</button>
+  </form>
+  <!--/LOOKUP-->`;
 
 // The working part of the form (notice, email check, item picker, submit, receipt, past requests) is shared by every
 // template; templates differ in their header, their CSS and their style options.
 const formBody = `
   <!--NOTICE--><div class="er-notice">{{notice}}</div><!--/NOTICE-->
+
+  ${LOOKUP_BLOCK}
 
   <!--VERIFY-->
   <h1 class="er-h1" tabindex="-1">Confirm it's you</h1>

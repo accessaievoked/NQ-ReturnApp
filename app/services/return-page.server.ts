@@ -3,12 +3,11 @@ import { fmtMoney } from "../lib/format";
 import {
   DEFAULT_FORM_CSS,
   DEFAULT_FORM_HTML,
-  compileStyle,
+  buildFormDocument,
   escapeHtml,
   normalizeStyle,
   renderReturnForm,
   type FormData,
-  type FormStyle,
 } from "../lib/return-form-template";
 import { RETURN_FORM_SCRIPT } from "../lib/return-form-script";
 import { PortalError, getPortalSettings, lookupOrderBy, requestsForOrder, type LookupResult, type OrderRef } from "./portal.server";
@@ -81,16 +80,22 @@ export async function renderReturnPage(shopDomain: string, input: PageInput): Pr
     photoMode,
     requestsHtml: "",
   });
+  // The "find your order" screen: opened from a link (no order yet), or the typed order number/email didn't match.
+  const lookupScreen = (error: string): FormData => ({
+    ...unverified(""),
+    orderName: "",
+    orderId: "",
+    verify: { needed: false },
+    lookup: { needed: true, error, order: input.ref.number ?? "", email: input.email ?? "" },
+  });
 
   let data: FormData;
-  let status = 200;
+  const status = 200;
   const triedProof = !!(input.customerId || input.email);
   if (!rawRef) {
-    data = unverified("");
-    data.orderName = "your order";
-    status = 400;
+    data = lookupScreen("");
   } else if (!triedProof) {
-    data = unverified(""); // ask for the email; nothing about the order is revealed yet
+    data = unverified(""); // an order button / link without a login: ask for the email; nothing about the order is revealed yet
   } else {
     try {
       const found = await lookupOrderBy(shopDomain, input.ref, { customerId: input.customerId, email: input.email });
@@ -98,28 +103,20 @@ export async function renderReturnPage(shopDomain: string, input: PageInput): Pr
       data = toFormData(found, { requestsHtml: requestsMarkup(requests), photoMode });
     } catch (e) {
       if (!(e instanceof PortalError)) throw e;
-      data = unverified(e.message);
+      data = input.ref.id ? unverified(e.message) : lookupScreen(e.message); // typed in by hand -> let them correct it
     }
   }
 
-  return { status, html: pageHtml({ body: renderReturnForm(template, data), css, style, data, email: input.customerId ? "" : input.email ?? "", requireNote: settings.requireNote }) };
-}
-
-function pageHtml(p: { body: string; css: string; style: FormStyle; data: FormData; email: string; requireNote: boolean }) {
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex">
-<title>Return or exchange${p.data.orderName ? ` · ${escapeHtml(p.data.orderName)}` : ""}</title>
-<style>body{margin:0;background:#fff}${"\n"}${p.css}${"\n"}${compileStyle(p.style)}</style>
-</head>
-<body>
-<div class="er-root" data-order-id="${escapeHtml(p.data.orderId)}" data-email="${escapeHtml(p.email)}" data-photo-mode="${p.data.photoMode}" data-require-note="${p.requireNote}">
-${p.body}
-</div>
-<script>${RETURN_FORM_SCRIPT}</script>
-</body>
-</html>`;
+  const html = buildFormDocument({
+    body: renderReturnForm(template, data),
+    css,
+    style,
+    orderName: data.orderName,
+    orderId: data.orderId,
+    email: input.customerId ? "" : input.email ?? "",
+    photoMode: data.photoMode,
+    requireNote: settings.requireNote,
+    script: RETURN_FORM_SCRIPT,
+  });
+  return { status, html };
 }

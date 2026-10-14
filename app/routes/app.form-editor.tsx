@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ActionFunctionArgs, HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
@@ -11,7 +11,7 @@ import {
   DEFAULT_FORM_HTML,
   DEFAULT_STYLE,
   FORM_PRESETS,
-  compileStyle,
+  buildFormDocument,
   findMissingHooks,
   normalizeStyle,
   renderReturnForm,
@@ -74,13 +74,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return { ok: "Form design saved. It's live for customers now." };
 };
 
+type Screen = "lookup" | "verify" | "form" | "done";
+const SCREENS: [Screen, string][] = [["form", "Order form"], ["lookup", "Find your order"], ["verify", "Email check"], ["done", "Request sent"]];
+const DESKTOP_W = 1100;
+const PHONE_W = 390;
+
 // What the preview shows: a made-up order with a returnable item, one with a replacement, and one that can't be returned.
-const sample = (o: { photoMode: FormData["photoMode"]; notice: string | null; allowReturns: boolean; allowExchanges: boolean }, step: "form" | "verify"): FormData => ({
+const sample = (o: { photoMode: FormData["photoMode"]; notice: string | null; allowReturns: boolean; allowExchanges: boolean }, step: Screen): FormData => ({
   orderName: "#1089",
   orderId: "1089",
   daysLeftText: "26 days left in your 30-day return window",
   notice: o.notice,
   verify: { needed: step === "verify", orderParam: "id" },
+  lookup: { needed: step === "lookup" },
   items: [
     { key: "a", title: "Court Sneaker", variantTitle: "Size 38", priceText: "$100.00", imageUrl: null, eligible: true, reason: null, maxQty: 2, exchange: [{ variantId: "v1", label: "Court Sneaker — Size 39", diffText: "same price" }, { variantId: "v2", label: "Court Sneaker — Size 41", diffText: "$10.00 more" }] },
     { key: "b", title: "Canvas Tote", variantTitle: null, priceText: "$40.00", imageUrl: null, eligible: true, reason: null, maxQty: 1, exchange: [] },
@@ -125,22 +131,39 @@ export default function FormEditor() {
   const [html, setHtml] = useState(d.html);
   const [css, setCss] = useState(d.css);
   const [style, setStyle] = useState<FormStyle>(d.style);
-  const [step, setStep] = useState<"form" | "verify">("form");
+  const [step, setStep] = useState<Screen>("form");
+  const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
+  const frameBox = useRef<HTMLDivElement>(null);
+  const [boxW, setBoxW] = useState(0);
+  useEffect(() => {
+    const el = frameBox.current;
+    if (!el) return;
+    const measure = () => setBoxW(el.clientWidth);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const set = <K extends keyof FormStyle>(k: K, v: FormStyle[K]) => setStyle((s) => ({ ...s, [k]: v }));
 
-  // Same renderer + script the storefront uses, so what you see is what customers get. Nothing is ever submitted from here.
+  // The very same page builder, renderer and script the storefront uses (buildFormDocument), so what you see is what customers get.
+  // Nothing is ever submitted from here.
   const preview = useMemo(() => {
     let body = "";
-    let error = "";
     try {
-      body = renderReturnForm(html, sample(d, step));
+      body = renderReturnForm(html, sample(d, step === "done" ? "form" : step));
     } catch (e) {
-      error = String((e as Error).message);
+      body = `<p style="color:#b00">${String((e as Error).message)}</p>`;
     }
-    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:0;background:#fff}\n${css}\n${compileStyle(style)}</style></head><body>` +
-      `<div class="er-root" data-order-id="1089" data-email="" data-photo-mode="${d.photoMode}" data-require-note="false">${error ? `<p style="color:#b00">${error}</p>` : body}</div>` +
-      `<script>window.__erPreview=true;</script><script>${RETURN_FORM_SCRIPT}</script></body></html>`;
+    const showDone = `<script>window.__erPreview=true;${step === "done" ? `document.addEventListener("DOMContentLoaded",function(){var f=document.querySelector("[data-er-form]");if(f)f.hidden=true;var n=document.querySelector("[data-er-done]");if(n){n.hidden=false;var r=n.querySelector("[data-er-ref]");if(r)r.textContent="#1089-R1";}});` : ""}</script>
+`;
+    return buildFormDocument({ body, css, style, orderName: "#1089", orderId: "1089", email: "", photoMode: d.photoMode, requireNote: false, script: RETURN_FORM_SCRIPT, preview: showDone });
   }, [html, css, style, step, d]);
+
+  // Desktop shows the page at a real desktop width (scaled down to fit the panel); mobile at a real phone width.
+  const frameW = device === "mobile" ? PHONE_W : DESKTOP_W;
+  const scale = boxW ? Math.min(1, boxW / frameW) : 1;
+  const frameH = 760;
 
   const applyPreset = (id: string) => {
     const p = FORM_PRESETS.find((x) => x.id === id);
@@ -164,8 +187,8 @@ export default function FormEditor() {
         {result && "ok" in result && result.ok && <s-banner tone="success" dismissible>{result.ok}</s-banner>}
 
         <p style={{ margin: 0, fontSize: 14, color: COLORS.subdued }}>
-          This is the form customers see after clicking <strong>Return or exchange items</strong> on their order. Your design is saved for your store: change a few
-          options, or edit the HTML and CSS directly. The preview on the right is exactly what customers get.
+          One form, two ways in: customers either click <strong>Return or exchange items</strong> on their order (the form opens already filled for that order), or open your
+          returns page link and type their order number and email. Your design is saved for your store: change a few options, or edit the HTML and CSS directly. The preview is the real page.
         </p>
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))", gap: 16, alignItems: "start" }}>
@@ -258,14 +281,23 @@ export default function FormEditor() {
           <Card
             title="Preview"
             right={
-              <select value={step} onChange={(e) => setStep(e.target.value as "form" | "verify")} style={{ ...input, padding: "4px 8px" }} aria-label="Preview screen">
-                <option value="form">Order form</option>
-                <option value="verify">Email confirmation</option>
-              </select>
+              <div style={{ display: "flex", gap: 6 }}>
+                <select value={step} onChange={(e) => setStep(e.target.value as Screen)} style={{ ...input, padding: "4px 8px" }} aria-label="Preview screen">
+                  {SCREENS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
+                <select value={device} onChange={(e) => setDevice(e.target.value as "desktop" | "mobile")} style={{ ...input, padding: "4px 8px" }} aria-label="Preview device">
+                  <option value="desktop">Desktop</option>
+                  <option value="mobile">Phone</option>
+                </select>
+              </div>
             }
           >
-            <iframe title="Form preview" srcDoc={preview} sandbox="allow-scripts" style={{ width: "100%", height: 720, border: `1px solid ${COLORS.border}`, borderRadius: 10, background: "#fff" }} />
-            <p style={{ margin: "8px 0 0", fontSize: 12, color: COLORS.subdued }}>Sample order. You can click around, but nothing is submitted from the preview.</p>
+            <div ref={frameBox} style={{ width: "100%", height: frameH * scale, overflow: "hidden", border: `1px solid ${COLORS.border}`, borderRadius: 10, background: "#fff", display: "flex", justifyContent: "center" }}>
+              <iframe title="Form preview" srcDoc={preview} sandbox="allow-scripts" style={{ flex: "0 0 auto", width: frameW, height: frameH, border: 0, background: "#fff", transform: `scale(${scale})`, transformOrigin: "top center" }} />
+            </div>
+            <p style={{ margin: "8px 0 0", fontSize: 12, color: COLORS.subdued }}>
+              The real page, with a sample order. Switch screens to see what customers see at each step. You can click around; nothing is submitted.
+            </p>
           </Card>
         </div>
       </div>
